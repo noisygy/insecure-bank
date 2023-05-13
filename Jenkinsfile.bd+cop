@@ -1,0 +1,86 @@
+// Example Jenkinsfile with SIG Security Scan that implements:
+// - Black Duck INTELLIGENT & Coverity on Polaris FULL scans on pushes to "important" branches
+// - Black Duck RAPID & Coverity on Polaris INCREMENTAL scans on PRs to "important" branches
+// - Black Duck RAPID scans only on "unimportant" branches
+
+pipeline {
+    agent { label 'linux64' }
+    environment {
+        // production branches on which we want security reports
+        PRODUCTION = "${env.BRANCH_NAME ==~ /^(stage|release)$/ ? 'true' : 'false'}"
+        // Coverity full scan on important branches
+        FULLSCAN = "${env.BRANCH_NAME ==~ /^(main|master|develop|stage|release)$/ ? 'true' : 'false'}"
+        // Coverity incremental scan on PRs to important branches
+        INCRSCAN = "${env.CHANGE_TARGET ==~ /^(main|master|develop|stage|release)$/ ? 'true' : 'false'}"
+        // set project name to be repo name; prefix only need for shared SIG demo environments
+        PROJECT = sh(script: "echo chuckaude-\$(basename $GIT_URL .git)", returnStdout: true).trim()
+    }
+    tools {
+        maven 'maven-3.9'
+        jdk 'openjdk-11'
+    }
+    stages {
+        stage('Build') {
+            steps {
+                sh 'env | sort; mvn -B compile'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'mvn -B test'
+            }
+        }
+        stage('Scan') {
+            parallel {
+                stage('Black Duck') {
+                    environment {
+                        DETECT_PROJECT_NAME = "$PROJECT"
+                        DETECT_PROJECT_VERSION_NAME = "$BRANCH_NAME"
+                        DETECT_CODE_LOCATION_NAME = "$PROJECT-$BRANCH_NAME"
+                        DETECT_BLACKDUCK_SCAN_MODE = "${env.FULLSCAN == 'true' ? 'INTELLIGENT' : 'RAPID'}"
+                        DETECT_RISK_REPORT_PDF = "${env.PRODUCTION == 'true' ? 'true' : 'false'}"
+                        // only needed for shared SIG demo environments
+                        DETECT_EXCLUDED_DETECTOR_TYPES = 'GIT'
+                    }
+                    steps {
+                        script {
+                            status = synopsys_detect detectProperties: "--detect.policy.check.fail.on.severities=BLOCKER --detect.timeout=300", returnStatus: true
+                            if (status == 3) { unstable 'Policy Violation' }
+                            else if (status != 0) { error 'Detect Failure' }
+                        }
+                    }
+                }
+                stage('Coverity on Polaris Scan') {
+                    when { environment name: 'FULLSCAN', value: 'true' }
+                    steps {
+                        polaris arguments: "--co project.name=$PROJECT analyze -w", polarisCli: 'latest'
+                        sh '''
+                            curl -fLOsS https://www.chuckaude.com/repo/getIssues && chmod +x getIssues
+                            if [ -n "$FULLSCAN" ]; then
+                                ./getIssues --project PROJECT --branch $BRANCH_NAME --severity high | tee issues.txt
+                            elif [ -n "$INCRSCAN" ]; then
+                                ./getIssues --project $PROJECT --branch $BRANCH_NAME --compare $CHANGE_TARGET --new | tee issues.txt
+                            fi
+                            if [ $(grep -c 'no issues' issues.txt) -ne 0 ]; then touch issues_found; fi
+                        '''
+                        script {
+                            if (fileExists('issues_found')) { unstable 'Issues Detected' }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Deploy') {
+            when { environment name: 'PRODUCTION', value: 'true' }
+            steps {
+                sh 'mvn -B -DskipTests install'
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts allowEmptyArchive: true, artifacts: '.synopsys/polaris/configuration/synopsys.yml, .synopsys/polaris/data/coverity/*/idir/build-log.txt, *_BlackDuck_RiskReport.pdf'
+            cleanWs()
+        }
+    }
+}
